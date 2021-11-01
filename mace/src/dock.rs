@@ -209,9 +209,10 @@ impl Dock {
                     panel
                         .tab_bar
                         .handle_event(cx, event, &mut |cx, action| match action {
-                            tab_bar::Action::ReceivedDraggedItem(item) => {
-                                dispatch_action(cx, Action::TabBarReceivedDraggedItem(*panel_id, item))
-                            }
+                            tab_bar::Action::ReceivedDraggedItem(item) => dispatch_action(
+                                cx,
+                                Action::TabBarReceivedDraggedItem(*panel_id, item),
+                            ),
                             tab_bar::Action::TabWasPressed(tab_id) => {
                                 dispatch_action(cx, Action::TabWasPressed(*panel_id, tab_id))
                             }
@@ -219,7 +220,10 @@ impl Dock {
                                 dispatch_action(cx, Action::TabButtonWasPressed(*panel_id, tab_id))
                             }
                             tab_bar::Action::TabReceivedDraggedItem(tab_id, item) => {
-                                dispatch_action(cx, Action::TabReceivedDraggedItem(*panel_id, tab_id, item))
+                                dispatch_action(
+                                    cx,
+                                    Action::TabReceivedDraggedItem(*panel_id, tab_id, item),
+                                )
                             }
                         });
                 }

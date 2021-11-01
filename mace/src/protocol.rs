@@ -1,5 +1,5 @@
 use {
-    crate::{delta::Delta, text::Text},
+    crate::{delta::Delta, id::Id, text::Text},
     serde::{Deserialize, Serialize},
     std::{ffi::OsString, path::PathBuf},
 };
@@ -8,8 +8,8 @@ use {
 pub enum Request {
     GetFileTree(),
     OpenFile(PathBuf),
-    ApplyDelta(PathBuf, usize, Delta),
-    CloseFile(PathBuf),
+    ApplyDelta(FileId, usize, Delta),
+    CloseFile(FileId),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -21,9 +21,9 @@ pub enum ResponseOrNotification {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Response {
     GetFileTree(Result<FileTree, Error>),
-    OpenFile(Result<(PathBuf, usize, Text), Error>),
-    ApplyDelta(Result<PathBuf, Error>),
-    CloseFile(Result<PathBuf, Error>),
+    OpenFile(Result<(FileId, usize, Text), Error>),
+    ApplyDelta(Result<FileId, Error>),
+    CloseFile(Result<FileId, Error>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -46,10 +46,21 @@ pub struct DirectoryEntry {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Notification {
-    DeltaWasApplied(PathBuf, Delta),
+    DeltaWasApplied(FileId, Delta),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum Error {
+    AlreadyAParticipant,
+    NotAParticipant,
     Unknown(String),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct FileId(pub Id);
+
+impl AsRef<Id> for FileId {
+    fn as_ref(&self) -> &Id {
+        &self.0
+    }
 }

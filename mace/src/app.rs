@@ -74,7 +74,7 @@ struct AppInner {
 
 impl AppInner {
     fn new(cx: &mut Cx) -> AppInner {
-        let server = Server::new(env::current_dir().unwrap());
+        let mut server = Server::new(env::current_dir().unwrap());
         let (request_sender, request_receiver) = mpsc::channel();
         let response_or_notification_signal = cx.new_signal();
         let (response_or_notification_sender, response_or_notification_receiver) = mpsc::channel();
@@ -212,7 +212,9 @@ impl AppInner {
                         self.create_code_editor_tab(cx, state, panel_id, None, path);
                     }
                 }
-                dock::Action::TabWasPressed(panel_id, tab_id) => self.select_tab(cx, state, panel_id, tab_id),
+                dock::Action::TabWasPressed(panel_id, tab_id) => {
+                    self.select_tab(cx, state, panel_id, tab_id)
+                }
                 dock::Action::TabButtonWasPressed(panel_id, tab_id) => {
                     let tab = &state.tabs_by_tab_id[tab_id];
                     match tab.kind {
@@ -277,9 +279,7 @@ impl AppInner {
                     let node = &state.file_nodes_by_file_node_id[file_node_id];
                     if node.is_file() {
                         let path = state.file_node_path(file_node_id);
-                        if state.code_editor_state.document_id_by_path(&path).is_none() {
-                            self.create_code_editor_tab(cx, state, state.selected_panel_id, None, path);
-                        }
+                        self.create_code_editor_tab(cx, state, state.selected_panel_id, None, path);
                     }
                 }
                 file_tree::Action::FileNodeShouldStartDragging(file_node_id) => {
@@ -355,21 +355,9 @@ impl AppInner {
                 self.set_file_tree(cx, state, response.unwrap());
                 self.select_tab(cx, state, state.side_bar_panel_id, state.file_tree_tab_id);
             }
-            Response::OpenFile(response) => {
-                let (path, revision, text) = response.unwrap();
-                let document_id = state.code_editor_state.document_id_by_path(&path).unwrap();
-                state
-                    .code_editor_state
-                    .initialize_document(document_id, revision, text);
-                self.code_editor.redraw_views_for_document(
-                    cx,
-                    &state.code_editor_state,
-                    document_id,
-                );
-            }
             response => {
                 self.code_editor
-                    .handle_response(&mut state.code_editor_state, response, &mut {
+                    .handle_response(cx, &mut state.code_editor_state, response, &mut {
                         let request_sender = &self.request_sender;
                         move |request| request_sender.send(request).unwrap()
                     })
@@ -800,7 +788,7 @@ struct FileEdge {
     file_node_id: FileNodeId,
 }
 
-fn spawn_connection_listener(listener: TcpListener, server: Server) {
+fn spawn_connection_listener(listener: TcpListener, mut server: Server) {
     thread::spawn(move || {
         println!("Server listening on {}", listener.local_addr().unwrap());
         for stream in listener.incoming() {

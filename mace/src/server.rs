@@ -1,43 +1,44 @@
 use {
     crate::{
         delta::Delta,
-        protocol::{DirectoryEntry, Error, FileNode, FileTree, Notification, Request, Response},
+        id_allocator::IdAllocator,
+        id_map::IdMap,
+        protocol::{
+            DirectoryEntry, Error, FileId, FileNode, FileTree, Notification, Request, Response,
+        },
         text::Text,
     },
     std::{
         collections::{HashMap, VecDeque},
-        fmt, fs,
+        fmt, fs, mem,
         path::{Path, PathBuf},
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc, Mutex, RwLock,
-        },
+        sync::{Arc, Mutex, RwLock},
     },
 };
 
-#[derive(Clone)]
 pub struct Server {
-    shared: Arc<Shared>,
+    next_connection_id: usize,
+    shared: Arc<RwLock<Shared>>,
 }
 
 impl Server {
     pub fn new<P: Into<PathBuf>>(path: P) -> Server {
         Server {
-            shared: Arc::new(Shared {
-                next_connection_id: AtomicUsize::new(0),
+            next_connection_id: 0,
+            shared: Arc::new(RwLock::new(Shared {
                 path: path.into(),
-                documents_by_path: RwLock::new(HashMap::new()),
-            }),
+                file_id_allocator: IdAllocator::new(),
+                files_by_file_id: IdMap::new(),
+                file_ids_by_path: HashMap::new(),
+            })),
         }
     }
 
-    pub fn connect(&self, notification_sender: Box<dyn NotificationSender>) -> Connection {
+    pub fn connect(&mut self, notification_sender: Box<dyn NotificationSender>) -> Connection {
+        let connection_id = ConnectionId(self.next_connection_id);
+        self.next_connection_id += 1;
         Connection {
-            connection_id: ConnectionId(
-                self.shared
-                    .next_connection_id
-                    .fetch_add(1, Ordering::SeqCst),
-            ),
+            connection_id,
             shared: self.shared.clone(),
             notification_sender,
         }
@@ -46,7 +47,7 @@ impl Server {
 
 pub struct Connection {
     connection_id: ConnectionId,
-    shared: Arc<Shared>,
+    shared: Arc<RwLock<Shared>>,
     notification_sender: Box<dyn NotificationSender>,
 }
 
@@ -83,22 +84,29 @@ impl Connection {
             Ok(entries)
         }
 
-        Ok(FileTree {
-            path: self.shared.path.clone(),
-            root: FileNode::Directory {
-                entries: get_directory_entries(&self.shared.path)?,
-            },
-        })
+        let path = self.shared.read().unwrap().path.clone();
+        let root = FileNode::Directory {
+            entries: get_directory_entries(&path)?,
+        };
+        Ok(FileTree { path, root })
     }
 
-    pub fn open_file(&self, path: PathBuf) -> Result<(PathBuf, usize, Text), Error> {
-        let mut documents_by_path_guard = self.shared.documents_by_path.write().unwrap();
-        match documents_by_path_guard.get(&path) {
-            Some(document) => {
-                let mut document_guard = document.lock().unwrap();
+    pub fn open_file(&self, path: PathBuf) -> Result<(FileId, usize, Text), Error> {
+        let mut shared_guard = self.shared.write().unwrap();
 
-                let their_revision = document_guard.our_revision;
-                document_guard.participants_by_connection_id.insert(
+        match shared_guard.file_ids_by_path.get(&path) {
+            Some(&file_id) => {
+                let mut file_guard = shared_guard.files_by_file_id[file_id].lock().unwrap();
+
+                let their_revision = file_guard.our_revision;
+                let text = file_guard.text.clone();
+                if file_guard
+                    .participants_by_connection_id
+                    .contains_key(&self.connection_id)
+                {
+                    return Err(Error::AlreadyAParticipant);
+                }
+                file_guard.participants_by_connection_id.insert(
                     self.connection_id,
                     Participant {
                         their_revision,
@@ -106,14 +114,15 @@ impl Connection {
                     },
                 );
 
-                let text = document_guard.text.clone();
-                drop(document_guard);
+                drop(file_guard);
 
-                drop(documents_by_path_guard);
+                drop(shared_guard);
 
-                Ok((path, their_revision, text))
+                Ok((file_id, their_revision, text))
             }
             None => {
+                let file_id = FileId(shared_guard.file_id_allocator.allocate());
+
                 let bytes = fs::read(&path).map_err(|error| Error::Unknown(error.to_string()))?;
                 let text: Text = String::from_utf8_lossy(&bytes)
                     .lines()
@@ -129,100 +138,112 @@ impl Connection {
                         notification_sender: self.notification_sender.clone(),
                     },
                 );
+                let file = Mutex::new(File {
+                    path: path.clone(),
+                    our_revision: 0,
+                    text: text.clone(),
+                    outstanding_deltas: VecDeque::new(),
+                    participants_by_connection_id,
+                });
 
-                documents_by_path_guard.insert(
-                    path.clone(),
-                    Mutex::new(Document {
-                        our_revision: 0,
-                        text: text.clone(),
-                        outstanding_deltas: VecDeque::new(),
-                        participants_by_connection_id,
-                    }),
-                );
+                shared_guard.files_by_file_id.insert(file_id, file);
+                shared_guard.file_ids_by_path.insert(path, file_id);
 
-                drop(documents_by_path_guard);
+                drop(shared_guard);
 
-                Ok((path, 0, text))
+                Ok((file_id, 0, text))
             }
         }
     }
 
     fn apply_delta(
         &self,
-        path: PathBuf,
+        file_id: FileId,
         their_revision: usize,
         delta: Delta,
-    ) -> Result<PathBuf, Error> {
-        let documents_by_path_guard = self.shared.documents_by_path.read().unwrap();
+    ) -> Result<FileId, Error> {
+        let shared_guard = self.shared.read().unwrap();
 
-        let document = documents_by_path_guard.get(&path).unwrap();
-        let mut document_guard = document.lock().unwrap();
+        let mut file_guard = shared_guard
+            .files_by_file_id
+            .get(file_id)
+            .unwrap()
+            .lock()
+            .unwrap();
 
-        let unseen_delta_count = document_guard.our_revision - their_revision;
-        let seen_delta_count = document_guard.outstanding_deltas.len() - unseen_delta_count;
+        let unseen_delta_count = file_guard.our_revision - their_revision;
+        let seen_delta_count = file_guard.outstanding_deltas.len() - unseen_delta_count;
         let mut delta = delta;
-        for unseen_delta in document_guard
-            .outstanding_deltas
-            .iter()
-            .skip(seen_delta_count)
-        {
+        for unseen_delta in file_guard.outstanding_deltas.iter().skip(seen_delta_count) {
             delta = unseen_delta.clone().transform(delta).1;
         }
 
-        document_guard.our_revision += 1;
-        document_guard.text.apply_delta(delta.clone());
-        document_guard.outstanding_deltas.push_back(delta.clone());
+        file_guard.our_revision += 1;
+        file_guard.text.apply_delta(delta.clone());
+        file_guard.outstanding_deltas.push_back(delta.clone());
 
-        let participant = document_guard
+        let participant = file_guard
             .participants_by_connection_id
             .get_mut(&self.connection_id)
             .unwrap();
         participant.their_revision = their_revision;
 
-        let settled_revision = document_guard
+        let settled_revision = file_guard
             .participants_by_connection_id
             .values()
             .map(|participant| participant.their_revision)
             .min()
             .unwrap();
-        let unsettled_delta_count = document_guard.our_revision - settled_revision;
-        let settled_delta_count = document_guard.outstanding_deltas.len() - unsettled_delta_count;
-        document_guard
-            .outstanding_deltas
-            .drain(..settled_delta_count);
+        let unsettled_delta_count = file_guard.our_revision - settled_revision;
+        let settled_delta_count = file_guard.outstanding_deltas.len() - unsettled_delta_count;
+        file_guard.outstanding_deltas.drain(..settled_delta_count);
 
-        document_guard.notify_other_participants(
+        file_guard.notify_other_participants(
             self.connection_id,
-            Notification::DeltaWasApplied(path.clone(), delta),
+            Notification::DeltaWasApplied(file_id, delta),
         );
 
-        drop(document_guard);
+        drop(file_guard);
 
-        drop(documents_by_path_guard);
+        drop(shared_guard);
 
-        Ok(path)
+        Ok(file_id)
     }
 
-    fn close_file(&self, path: PathBuf) -> Result<PathBuf, Error> {
-        let mut documents_by_path_guard = self.shared.documents_by_path.write().unwrap();
+    fn close_file(&self, file_id: FileId) -> Result<FileId, Error> {
+        let mut shared_guard = self.shared.write().unwrap();
 
-        let document = documents_by_path_guard.get(&path).unwrap();
-        let mut document_guard = document.lock().unwrap();
+        let mut file_guard = shared_guard
+            .files_by_file_id
+            .get(file_id)
+            .unwrap()
+            .lock()
+            .map_err(|_| Error::NotAParticipant)?;
 
-        document_guard
+        if !file_guard
+            .participants_by_connection_id
+            .contains_key(&self.connection_id)
+        {
+            return Err(Error::NotAParticipant);
+        }
+        file_guard
             .participants_by_connection_id
             .remove(&self.connection_id);
-
-        let is_empty = document_guard.participants_by_connection_id.is_empty();
-        drop(document_guard);
+        let is_empty = file_guard.participants_by_connection_id.is_empty();
 
         if is_empty {
-            documents_by_path_guard.remove(&path);
+            let path = mem::replace(&mut file_guard.path, PathBuf::new());
+            drop(file_guard);
+            shared_guard.file_ids_by_path.remove(&path);
+            shared_guard.files_by_file_id.remove(file_id);
+            shared_guard.file_id_allocator.deallocate(file_id.0);
+        } else {
+            drop(file_guard);
         }
 
-        drop(documents_by_path_guard);
+        drop(shared_guard);
 
-        Ok(path)
+        Ok(file_id)
     }
 }
 
@@ -257,22 +278,24 @@ impl fmt::Debug for dyn NotificationSender {
 #[derive(Debug)]
 struct Shared {
     path: PathBuf,
-    next_connection_id: AtomicUsize,
-    documents_by_path: RwLock<HashMap<PathBuf, Mutex<Document>>>,
+    file_id_allocator: IdAllocator,
+    files_by_file_id: IdMap<FileId, Mutex<File>>,
+    file_ids_by_path: HashMap<PathBuf, FileId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ConnectionId(usize);
 
 #[derive(Debug)]
-struct Document {
+struct File {
+    path: PathBuf,
     our_revision: usize,
     text: Text,
     outstanding_deltas: VecDeque<Delta>,
     participants_by_connection_id: HashMap<ConnectionId, Participant>,
 }
 
-impl Document {
+impl File {
     fn notify_other_participants(&self, connection_id: ConnectionId, notification: Notification) {
         for (other_connection_id, other_participant) in &self.participants_by_connection_id {
             if *other_connection_id == connection_id {

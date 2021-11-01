@@ -7,7 +7,7 @@ use {
         id_map::IdMap,
         position::Position,
         position_set::PositionSet,
-        protocol::{Notification, Request, Response},
+        protocol::{FileId, Notification, Request, Response},
         range_set::{RangeSet, Span},
         size::Size,
         text::Text,
@@ -19,7 +19,7 @@ use {
     std::{
         collections::{HashMap, HashSet, VecDeque},
         mem,
-        path::{Path, PathBuf},
+        path::PathBuf,
     },
 };
 
@@ -589,15 +589,24 @@ impl CodeEditor {
 
     pub fn handle_response(
         &mut self,
+        cx: &mut Cx,
         state: &mut State,
         response: Response,
         send_request: &mut dyn FnMut(Request),
     ) {
         match response {
-            Response::ApplyDelta(response) => {
-                let path = response.unwrap();
+            Response::OpenFile(response) => {
+                let (file_id, revision, text) = response.unwrap();
+                let document_id =
+                    state.finish_creating_document(file_id, revision, text, send_request);
+                self.redraw_views_for_document(cx, state, document_id);
+            }
 
-                let document_id = state.document_ids_by_path[&path];
+            Response::ApplyDelta(response) => {
+                let file_id = response.unwrap();
+
+                // TODO: Turn this code into a function finish_applying_delta
+                let document_id = state.document_ids_by_file_id[file_id];
 
                 let document = &mut state.documents_by_document_id[document_id];
                 let document_inner = document.inner.as_mut().unwrap();
@@ -605,21 +614,15 @@ impl CodeEditor {
                 document_inner.revision += 1;
                 if let Some(outstanding_delta) = document_inner.outstanding_deltas.front() {
                     send_request(Request::ApplyDelta(
-                        path.clone(),
+                        file_id,
                         document_inner.revision,
                         outstanding_delta.clone(),
                     ));
                 }
             }
             Response::CloseFile(response) => {
-                let path = response.unwrap();
-
-                let document_id = state.document_ids_by_path[&path];
-
-                let document = &mut state.documents_by_document_id[document_id];
-                state.document_ids_by_path.remove(&document.path);
-                state.documents_by_document_id.remove(document_id);
-                state.document_id_allocator.deallocate(document_id.0);
+                let file_id = response.unwrap();
+                state.finish_destroying_document(file_id);
             }
             _ => {}
         }
@@ -632,8 +635,8 @@ impl CodeEditor {
         notification: Notification,
     ) {
         match notification {
-            Notification::DeltaWasApplied(path, delta) => {
-                let document_id = state.document_ids_by_path[&path];
+            Notification::DeltaWasApplied(file_id, delta) => {
+                let document_id = state.document_ids_by_file_id[file_id];
 
                 let document = &mut state.documents_by_document_id[document_id];
                 let document_inner = document.inner.as_mut().unwrap();
@@ -695,6 +698,8 @@ pub struct State {
     document_id_allocator: IdAllocator,
     documents_by_document_id: IdMap<DocumentId, Document>,
     document_ids_by_path: HashMap<PathBuf, DocumentId>,
+    document_ids_by_file_id: IdMap<FileId, DocumentId>,
+    outstanding_document_id_queue: VecDeque<DocumentId>,
 }
 
 impl State {
@@ -707,7 +712,7 @@ impl State {
         path: PathBuf,
         send_request: &mut dyn FnMut(Request),
     ) -> SessionId {
-        let document_id = self.create_document(path, send_request);
+        let document_id = self.get_or_start_creating_document(path, send_request);
         let session_id = SessionId(self.session_id_allocator.allocate());
         let session = Session {
             view_id: None,
@@ -732,51 +737,86 @@ impl State {
         let document = &mut self.documents_by_document_id[document_id];
         document.session_ids.remove(&session_id);
         if document.session_ids.is_empty() {
-            self.destroy_document(document_id, send_request);
+            self.start_destroying_document(document_id, send_request);
         }
         self.sessions_by_session_id.remove(session_id);
         self.session_id_allocator.deallocate(session_id.0);
     }
 
-    fn create_document(
+    fn get_or_start_creating_document(
         &mut self,
         path: PathBuf,
         send_request: &mut dyn FnMut(Request),
     ) -> DocumentId {
-        let document_id = DocumentId(self.document_id_allocator.allocate());
-        self.documents_by_document_id.insert(
-            document_id,
-            Document {
-                session_ids: HashSet::new(),
-                path: path.clone(),
-                inner: None,
-            },
-        );
-        self.document_ids_by_path.insert(path.clone(), document_id);
-        send_request(Request::OpenFile(path));
-        document_id
+        match self.document_ids_by_path.get(&path) {
+            Some(document_id) => *document_id,
+            None => {
+                let document_id = DocumentId(self.document_id_allocator.allocate());
+                self.documents_by_document_id.insert(
+                    document_id,
+                    Document {
+                        session_ids: HashSet::new(),
+                        is_destroyed: false,
+                        path: path.clone(),
+                        inner: None,
+                    },
+                );
+                self.document_ids_by_path.insert(path.clone(), document_id);
+                self.outstanding_document_id_queue.push_back(document_id);
+                send_request(Request::OpenFile(path));
+                document_id
+            }
+        }
     }
 
-    pub fn initialize_document(&mut self, document_id: DocumentId, revision: usize, text: Text) {
+    pub fn finish_creating_document(
+        &mut self,
+        file_id: FileId,
+        revision: usize,
+        text: Text,
+        send_request: &mut dyn FnMut(Request),
+    ) -> DocumentId {
+        let document_id = self.outstanding_document_id_queue.pop_front().unwrap();
         let document = &mut self.documents_by_document_id[document_id];
         let token_cache = TokenCache::new(&text);
         document.inner = Some(DocumentInner {
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
+            file_id,
             revision,
             text,
             token_cache,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             outstanding_deltas: VecDeque::new(),
         });
+        self.document_ids_by_file_id.insert(file_id, document_id);
+        if document.is_destroyed {
+            let inner = document.inner.as_ref().unwrap();
+            send_request(Request::CloseFile(inner.file_id))
+        }
+        document_id
     }
 
-    fn destroy_document(&mut self, document_id: DocumentId, send_request: &mut dyn FnMut(Request)) {
-        let document = &self.documents_by_document_id[document_id];
-        send_request(Request::CloseFile(document.path.clone()));
+    fn start_destroying_document(
+        &mut self,
+        document_id: DocumentId,
+        send_request: &mut dyn FnMut(Request),
+    ) {
+        let document = &mut self.documents_by_document_id[document_id];
+        match &mut document.inner {
+            Some(inner) => send_request(Request::CloseFile(inner.file_id)),
+            None => document.is_destroyed = true,
+        }
+        self.document_ids_by_path.remove(&document.path);
     }
 
-    pub fn document_id_by_path(&self, path: &Path) -> Option<DocumentId> {
-        self.document_ids_by_path.get(path).cloned()
+    fn finish_destroying_document(&mut self, file_id: FileId) {
+        let document_id = self.document_ids_by_file_id[file_id];
+
+        let document = &mut self.documents_by_document_id[document_id];
+        let inner = document.inner.as_ref().unwrap();
+        self.document_ids_by_file_id.remove(inner.file_id);
+        self.documents_by_document_id.remove(document_id);
+        self.document_id_allocator.deallocate(document_id.0);
     }
 
     fn add_cursor(&mut self, session_id: SessionId, position: Position) {
@@ -935,7 +975,7 @@ impl State {
             let session = &mut self.sessions_by_session_id[session_id];
             let document = &mut self.documents_by_document_id[session.document_id];
             document.apply_delta(undo.delta.clone());
-            document.schedule_apply_delta_request(undo.delta, send_request);
+            document.start_applying_delta(undo.delta, send_request);
         }
     }
 
@@ -967,7 +1007,7 @@ impl State {
             let session = &mut self.sessions_by_session_id[session_id];
             let document = &mut self.documents_by_document_id[session.document_id];
             document.apply_delta(redo.delta.clone());
-            document.schedule_apply_delta_request(redo.delta, send_request);
+            document.start_applying_delta(redo.delta, send_request);
         }
     }
 
@@ -1002,7 +1042,7 @@ impl State {
         let session = &mut self.sessions_by_session_id[session_id];
         let document = &mut self.documents_by_document_id[session.document_id];
         document.apply_delta(delta.clone());
-        document.schedule_apply_delta_request(delta, send_request);
+        document.start_applying_delta(delta, send_request);
     }
 }
 
@@ -1045,17 +1085,19 @@ impl AsRef<Id> for DocumentId {
 }
 
 struct Document {
-    path: PathBuf,
     session_ids: HashSet<SessionId>,
+    is_destroyed: bool,
+    path: PathBuf,
     inner: Option<DocumentInner>,
 }
 
 struct DocumentInner {
-    undo_stack: Vec<Edit>,
-    redo_stack: Vec<Edit>,
+    file_id: FileId,
     revision: usize,
     text: Text,
     token_cache: TokenCache,
+    undo_stack: Vec<Edit>,
+    redo_stack: Vec<Edit>,
     outstanding_deltas: VecDeque<Delta>,
 }
 
@@ -1067,11 +1109,7 @@ impl Document {
         inner.token_cache.refresh(&inner.text);
     }
 
-    fn schedule_apply_delta_request(
-        &mut self,
-        delta: Delta,
-        send_request: &mut dyn FnMut(Request),
-    ) {
+    fn start_applying_delta(&mut self, delta: Delta, send_request: &mut dyn FnMut(Request)) {
         let inner = self.inner.as_mut().unwrap();
         if inner.outstanding_deltas.len() == 2 {
             let outstanding_delta = inner.outstanding_deltas.pop_back().unwrap();
@@ -1082,7 +1120,7 @@ impl Document {
             inner.outstanding_deltas.push_back(delta.clone());
             if inner.outstanding_deltas.len() == 1 {
                 send_request(Request::ApplyDelta(
-                    self.path.clone(),
+                    inner.file_id,
                     inner.revision,
                     inner.outstanding_deltas.front().unwrap().clone(),
                 ));

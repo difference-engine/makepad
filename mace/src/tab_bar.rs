@@ -40,11 +40,14 @@ impl TabBar {
 
     pub fn end(&mut self, cx: &mut Cx) {
         if self.is_dragged {
-            self.drag.draw_quad_walk(cx, Walk {
-                width: Width::Fill,
-                height: Height::Fill,
-                ..Walk::default()
-            });
+            self.drag.draw_quad_walk(
+                cx,
+                Walk {
+                    width: Width::Fill,
+                    height: Height::Fill,
+                    ..Walk::default()
+                },
+            );
         }
         self.view.end_view(cx);
     }
@@ -150,8 +153,8 @@ impl TabBar {
                         event.action = DragAction::Copy;
                     }
                     _ => panic!(),
-                }
-            }
+                },
+            },
             Event::FingerDrop(event) => {
                 self.is_dragged = false;
                 self.redraw(cx);

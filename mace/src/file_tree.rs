@@ -297,7 +297,8 @@ impl FileTree {
         file_node_id: FileNodeId,
         dragged_item: DraggedItem,
     ) {
-        self.logic.start_dragging_node(cx, file_node_id.0, dragged_item);
+        self.logic
+            .start_dragging_node(cx, file_node_id.0, dragged_item);
     }
 
     pub fn redraw(&mut self, cx: &mut Cx) {
