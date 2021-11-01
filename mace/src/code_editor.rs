@@ -598,21 +598,7 @@ impl CodeEditor {
 
             Response::ApplyDelta(response) => {
                 let file_id = response.unwrap();
-
-                // TODO: Turn this code into a function finish_applying_delta
-                let document_id = state.document_ids_by_file_id[file_id];
-
-                let document = &mut state.documents_by_document_id[document_id];
-                let document_inner = document.inner.as_mut().unwrap();
-                document_inner.outstanding_deltas.pop_front();
-                document_inner.revision += 1;
-                if let Some(outstanding_delta) = document_inner.outstanding_deltas.front() {
-                    send_request(Request::ApplyDelta(
-                        file_id,
-                        document_inner.revision,
-                        outstanding_delta.clone(),
-                    ));
-                }
+                state.handle_apply_delta_response(file_id, send_request);
             }
             Response::CloseFile(response) => {
                 let file_id = response.unwrap();
@@ -630,7 +616,7 @@ impl CodeEditor {
     ) {
         match notification {
             Notification::DeltaWasApplied(file_id, delta) => {
-                let document_id = state.finish_applying_delta(file_id, delta);
+                let document_id = state.handle_delta_applied_notification(file_id, delta);
                 self.redraw_views_for_document(cx, state, document_id);
             }
         }

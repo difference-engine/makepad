@@ -227,10 +227,14 @@ impl CodeEditorState {
         let (_, new_delta_1) = delta_0.clone().transform(delta_1);
         let delta = delta_0.compose(new_delta_1);
 
-        self.start_applying_delta(session_id, delta, send_request);
+        self.apply_delta(session_id, delta, send_request);
     }
 
-    pub fn insert_backspace(&mut self, session_id: SessionId, send_request: &mut dyn FnMut(Request)) {
+    pub fn insert_backspace(
+        &mut self,
+        session_id: SessionId,
+        send_request: &mut dyn FnMut(Request),
+    ) {
         let session = &self.sessions_by_session_id[session_id];
         let document = &self.documents_by_document_id[session.document_id];
         let document_inner = document.inner.as_ref().unwrap();
@@ -274,7 +278,7 @@ impl CodeEditorState {
         let (_, new_delta_1) = delta_0.clone().transform(delta_1);
         let delta = delta_0.compose(new_delta_1);
 
-        self.start_applying_delta(session_id, delta, send_request);
+        self.apply_delta(session_id, delta, send_request);
     }
 
     pub fn undo(&mut self, session_id: SessionId, send_request: &mut dyn FnMut(Request)) {
@@ -304,8 +308,8 @@ impl CodeEditorState {
 
             let session = &mut self.sessions_by_session_id[session_id];
             let document = &mut self.documents_by_document_id[session.document_id];
-            document.apply_delta_locally(undo.delta.clone());
-            document.start_applying_delta_remotely(undo.delta, send_request);
+            document.apply_delta(undo.delta.clone());
+            document.schedule_apply_delta_request(undo.delta, send_request);
         }
     }
 
@@ -336,12 +340,12 @@ impl CodeEditorState {
 
             let session = &mut self.sessions_by_session_id[session_id];
             let document = &mut self.documents_by_document_id[session.document_id];
-            document.apply_delta_locally(redo.delta.clone());
-            document.start_applying_delta_remotely(redo.delta, send_request);
+            document.apply_delta(redo.delta.clone());
+            document.schedule_apply_delta_request(redo.delta, send_request);
         }
     }
 
-    fn start_applying_delta(
+    fn apply_delta(
         &mut self,
         session_id: SessionId,
         delta: Delta,
@@ -371,11 +375,35 @@ impl CodeEditorState {
 
         let session = &mut self.sessions_by_session_id[session_id];
         let document = &mut self.documents_by_document_id[session.document_id];
-        document.apply_delta_locally(delta.clone());
-        document.start_applying_delta_remotely(delta, send_request);
+        document.apply_delta(delta.clone());
+        document.schedule_apply_delta_request(delta, send_request);
     }
 
-    pub fn finish_applying_delta(&mut self, file_id: FileId, delta: Delta) -> DocumentId {
+    pub fn handle_apply_delta_response(
+        &mut self,
+        file_id: FileId,
+        send_request: &mut dyn FnMut(Request),
+    ) {
+        let document_id = self.document_ids_by_file_id[file_id];
+        let document = &mut self.documents_by_document_id[document_id];
+        let document_inner = document.inner.as_mut().unwrap();
+
+        document_inner.outstanding_deltas.pop_front();
+        document_inner.revision += 1;
+        if let Some(outstanding_delta) = document_inner.outstanding_deltas.front() {
+            send_request(Request::ApplyDelta(
+                file_id,
+                document_inner.revision,
+                outstanding_delta.clone(),
+            ));
+        }
+    }
+
+    pub fn handle_delta_applied_notification(
+        &mut self,
+        file_id: FileId,
+        delta: Delta,
+    ) -> DocumentId {
         let document_id = self.document_ids_by_file_id[file_id];
         let document = &mut self.documents_by_document_id[document_id];
         let document_inner = document.inner.as_mut().unwrap();
@@ -400,7 +428,7 @@ impl CodeEditorState {
         let document = &mut self.documents_by_document_id[document_id];
         let document_inner = document.inner.as_mut().unwrap();
         document_inner.revision += 1;
-        document.apply_delta_locally(delta);
+        document.apply_delta(delta);
         document_id
     }
 }
@@ -451,14 +479,18 @@ pub struct Document {
 }
 
 impl Document {
-    fn apply_delta_locally(&mut self, delta: Delta) {
+    fn apply_delta(&mut self, delta: Delta) {
         let inner = self.inner.as_mut().unwrap();
         inner.token_cache.invalidate(&delta);
         inner.text.apply_delta(delta);
         inner.token_cache.refresh(&inner.text);
     }
 
-    fn start_applying_delta_remotely(&mut self, delta: Delta, send_request: &mut dyn FnMut(Request)) {
+    fn schedule_apply_delta_request(
+        &mut self,
+        delta: Delta,
+        send_request: &mut dyn FnMut(Request),
+    ) {
         let inner = self.inner.as_mut().unwrap();
         if inner.outstanding_deltas.len() == 2 {
             let outstanding_delta = inner.outstanding_deltas.pop_back().unwrap();
@@ -490,8 +522,8 @@ pub struct DocumentInner {
 
 #[derive(Debug)]
 pub struct Edit {
-    cursors: CursorSet,
-    delta: Delta,
+    pub cursors: CursorSet,
+    pub delta: Delta,
 }
 
 fn transform_edit_stack(edit_stack: &mut Vec<Edit>, delta: Delta) {
