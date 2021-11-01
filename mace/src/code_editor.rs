@@ -592,17 +592,12 @@ impl CodeEditor {
             Response::OpenFile(response) => {
                 let (file_id, revision, text) = response.unwrap();
                 let document_id =
-                    state.finish_creating_document(file_id, revision, text, send_request);
+                    state.handle_open_file_response(file_id, revision, text, send_request);
                 self.redraw_views_for_document(cx, state, document_id);
             }
-
             Response::ApplyDelta(response) => {
                 let file_id = response.unwrap();
                 state.handle_apply_delta_response(file_id, send_request);
-            }
-            Response::CloseFile(response) => {
-                let file_id = response.unwrap();
-                state.finish_destroying_document(file_id);
             }
             _ => {}
         }

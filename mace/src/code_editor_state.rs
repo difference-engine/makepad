@@ -42,7 +42,7 @@ impl CodeEditorState {
         path: PathBuf,
         send_request: &mut dyn FnMut(Request),
     ) -> SessionId {
-        let document_id = self.get_or_start_creating_document(path, send_request);
+        let document_id = self.get_or_create_document(path, send_request);
         let session_id = SessionId(self.session_id_allocator.allocate());
         let session = Session {
             view_id: None,
@@ -67,26 +67,30 @@ impl CodeEditorState {
         let document = &mut self.documents_by_document_id[document_id];
         document.session_ids.remove(&session_id);
         if document.session_ids.is_empty() {
-            self.start_destroying_document(document_id, send_request);
+            self.destroy_document(document_id, send_request);
         }
         self.sessions_by_session_id.remove(session_id);
         self.session_id_allocator.deallocate(session_id.0);
     }
 
-    pub fn get_or_start_creating_document(
+    pub fn get_or_create_document(
         &mut self,
         path: PathBuf,
         send_request: &mut dyn FnMut(Request),
     ) -> DocumentId {
         match self.document_ids_by_path.get(&path) {
-            Some(document_id) => *document_id,
+            Some(document_id) => {
+                let document = &mut self.documents_by_document_id[*document_id];
+                document.should_be_destroyed = false;
+                *document_id
+            },
             None => {
                 let document_id = DocumentId(self.document_id_allocator.allocate());
                 self.documents_by_document_id.insert(
                     document_id,
                     Document {
                         session_ids: HashSet::new(),
-                        is_destroyed: false,
+                        should_be_destroyed: false,
                         path: path.clone(),
                         inner: None,
                     },
@@ -99,7 +103,7 @@ impl CodeEditorState {
         }
     }
 
-    pub fn finish_creating_document(
+    pub fn handle_open_file_response(
         &mut self,
         file_id: FileId,
         revision: usize,
@@ -119,34 +123,33 @@ impl CodeEditorState {
             outstanding_deltas: VecDeque::new(),
         });
         self.document_ids_by_file_id.insert(file_id, document_id);
-        if document.is_destroyed {
-            let inner = document.inner.as_ref().unwrap();
-            send_request(Request::CloseFile(inner.file_id))
+        if document.should_be_destroyed {
+            self.destroy_document_deferred(document_id, send_request);
         }
         document_id
     }
 
-    pub fn start_destroying_document(
+    pub fn destroy_document(
         &mut self,
         document_id: DocumentId,
         send_request: &mut dyn FnMut(Request),
     ) {
         let document = &mut self.documents_by_document_id[document_id];
-        match &mut document.inner {
-            Some(inner) => send_request(Request::CloseFile(inner.file_id)),
-            None => document.is_destroyed = true,
+        if document.inner.is_some() {
+            self.destroy_document_deferred(document_id, send_request);
+        } else {
+            document.should_be_destroyed = true;
         }
-        self.document_ids_by_path.remove(&document.path);
     }
 
-    pub fn finish_destroying_document(&mut self, file_id: FileId) {
-        let document_id = self.document_ids_by_file_id[file_id];
-
+    fn destroy_document_deferred(&mut self, document_id: DocumentId, send_request: &mut dyn FnMut(Request)) {
         let document = &mut self.documents_by_document_id[document_id];
         let inner = document.inner.as_ref().unwrap();
-        self.document_ids_by_file_id.remove(inner.file_id);
+        let file_id = inner.file_id;
+        self.document_ids_by_file_id.remove(file_id);
         self.documents_by_document_id.remove(document_id);
         self.document_id_allocator.deallocate(document_id.0);
+        send_request(Request::CloseFile(file_id))
     }
 
     pub fn add_cursor(&mut self, session_id: SessionId, position: Position) {
@@ -473,7 +476,7 @@ impl AsRef<Id> for DocumentId {
 
 pub struct Document {
     pub session_ids: HashSet<SessionId>,
-    pub is_destroyed: bool,
+    pub should_be_destroyed: bool,
     pub path: PathBuf,
     pub inner: Option<DocumentInner>,
 }
