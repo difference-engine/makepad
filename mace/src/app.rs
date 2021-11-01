@@ -1,6 +1,7 @@
 use {
     crate::{
-        code_editor::{self, CodeEditor, SessionId, ViewId},
+        code_editor::{self, CodeEditor, ViewId},
+        code_editor_state::{CodeEditorState, SessionId},
         dock::{self, Dock, DragPosition, PanelId},
         file_tree::{self, FileNodeId, FileTree},
         id_allocator::IdAllocator,
@@ -567,7 +568,7 @@ struct State {
     file_nodes_by_file_node_id: IdMap<FileNodeId, FileNode>,
     path: PathBuf,
     root_file_node_id: FileNodeId,
-    code_editor_state: code_editor::State,
+    code_editor_state: CodeEditorState,
 }
 
 impl State {
@@ -646,7 +647,7 @@ impl State {
             file_nodes_by_file_node_id,
             path: PathBuf::new(),
             root_file_node_id,
-            code_editor_state: code_editor::State::new(),
+            code_editor_state: CodeEditorState::new(),
         }
     }
 

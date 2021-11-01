@@ -1,13 +1,12 @@
 use {
     crate::{
-        cursor_set::CursorSet,
-        delta::{self, Delta, Whose},
+        code_editor_state::{CodeEditorState, DocumentId, SessionId},
         id::Id,
         id_allocator::IdAllocator,
         id_map::IdMap,
         position::Position,
         position_set::PositionSet,
-        protocol::{FileId, Notification, Request, Response},
+        protocol::{Notification, Request, Response},
         range_set::{RangeSet, Span},
         size::Size,
         text::Text,
@@ -16,11 +15,6 @@ use {
     },
     makepad_render::*,
     makepad_widget::*,
-    std::{
-        collections::{HashMap, HashSet, VecDeque},
-        mem,
-        path::PathBuf,
-    },
 };
 
 pub struct CodeEditor {
@@ -87,7 +81,7 @@ impl CodeEditor {
         }
     }
 
-    pub fn draw(&mut self, cx: &mut Cx, state: &State, view_id: ViewId) {
+    pub fn draw(&mut self, cx: &mut Cx, state: &CodeEditorState, view_id: ViewId) {
         let view = &mut self.views_by_view_id[view_id];
         if view.view.begin_view(cx, Layout::default()).is_ok() {
             if let Some(session_id) = view.session_id {
@@ -369,7 +363,7 @@ impl CodeEditor {
     pub fn create_view(
         &mut self,
         cx: &mut Cx,
-        state: &mut State,
+        state: &mut CodeEditorState,
         session_id: Option<SessionId>,
     ) -> ViewId {
         let view_id = ViewId(self.view_id_allocator.allocate());
@@ -395,7 +389,7 @@ impl CodeEditor {
     pub fn set_view_session_id(
         &mut self,
         cx: &mut Cx,
-        state: &mut State,
+        state: &mut CodeEditorState,
         view_id: ViewId,
         session_id: Option<SessionId>,
     ) {
@@ -420,7 +414,7 @@ impl CodeEditor {
     pub fn redraw_views_for_document(
         &mut self,
         cx: &mut Cx,
-        state: &State,
+        state: &CodeEditorState,
         document_id: DocumentId,
     ) {
         let document = &state.documents_by_document_id[document_id];
@@ -436,7 +430,7 @@ impl CodeEditor {
     pub fn handle_event(
         &mut self,
         cx: &mut Cx,
-        state: &mut State,
+        state: &mut CodeEditorState,
         view_id: ViewId,
         event: &mut Event,
         send_request: &mut dyn FnMut(Request),
@@ -590,7 +584,7 @@ impl CodeEditor {
     pub fn handle_response(
         &mut self,
         cx: &mut Cx,
-        state: &mut State,
+        state: &mut CodeEditorState,
         response: Response,
         send_request: &mut dyn FnMut(Request),
     ) {
@@ -631,37 +625,12 @@ impl CodeEditor {
     pub fn handle_notification(
         &mut self,
         cx: &mut Cx,
-        state: &mut State,
+        state: &mut CodeEditorState,
         notification: Notification,
     ) {
         match notification {
             Notification::DeltaWasApplied(file_id, delta) => {
-                let document_id = state.document_ids_by_file_id[file_id];
-
-                let document = &mut state.documents_by_document_id[document_id];
-                let document_inner = document.inner.as_mut().unwrap();
-                let mut delta = delta;
-                for outstanding_delta_ref in &mut document_inner.outstanding_deltas {
-                    let outstanding_delta = mem::replace(outstanding_delta_ref, Delta::identity());
-                    let (new_delta, new_outstanding_delta) = delta.transform(outstanding_delta);
-                    delta = new_delta;
-                    *outstanding_delta_ref = new_outstanding_delta;
-                }
-
-                transform_edit_stack(&mut document_inner.undo_stack, delta.clone());
-                transform_edit_stack(&mut document_inner.redo_stack, delta.clone());
-
-                let document = &state.documents_by_document_id[document_id];
-                for session_id in document.session_ids.iter().cloned() {
-                    let session = &mut state.sessions_by_session_id[session_id];
-                    session.apply_delta(&delta, Whose::Theirs);
-                }
-
-                let document = &mut state.documents_by_document_id[document_id];
-                let document_inner = document.inner.as_mut().unwrap();
-                document_inner.revision += 1;
-                document.apply_delta(delta);
-
+                let document_id = state.finish_applying_delta(file_id, delta);
                 self.redraw_views_for_document(cx, state, document_id);
             }
         }
@@ -691,464 +660,9 @@ pub struct View {
     session_id: Option<SessionId>,
 }
 
-#[derive(Default)]
-pub struct State {
-    session_id_allocator: IdAllocator,
-    sessions_by_session_id: IdMap<SessionId, Session>,
-    document_id_allocator: IdAllocator,
-    documents_by_document_id: IdMap<DocumentId, Document>,
-    document_ids_by_path: HashMap<PathBuf, DocumentId>,
-    document_ids_by_file_id: IdMap<FileId, DocumentId>,
-    outstanding_document_id_queue: VecDeque<DocumentId>,
-}
-
-impl State {
-    pub fn new() -> State {
-        State::default()
-    }
-
-    pub fn create_session(
-        &mut self,
-        path: PathBuf,
-        send_request: &mut dyn FnMut(Request),
-    ) -> SessionId {
-        let document_id = self.get_or_start_creating_document(path, send_request);
-        let session_id = SessionId(self.session_id_allocator.allocate());
-        let session = Session {
-            view_id: None,
-            cursors: CursorSet::new(),
-            selections: RangeSet::new(),
-            carets: PositionSet::new(),
-            document_id,
-        };
-        self.sessions_by_session_id.insert(session_id, session);
-        let document = &mut self.documents_by_document_id[document_id];
-        document.session_ids.insert(session_id);
-        session_id
-    }
-
-    pub fn destroy_session(
-        &mut self,
-        session_id: SessionId,
-        send_request: &mut dyn FnMut(Request),
-    ) {
-        let session = &self.sessions_by_session_id[session_id];
-        let document_id = session.document_id;
-        let document = &mut self.documents_by_document_id[document_id];
-        document.session_ids.remove(&session_id);
-        if document.session_ids.is_empty() {
-            self.start_destroying_document(document_id, send_request);
-        }
-        self.sessions_by_session_id.remove(session_id);
-        self.session_id_allocator.deallocate(session_id.0);
-    }
-
-    fn get_or_start_creating_document(
-        &mut self,
-        path: PathBuf,
-        send_request: &mut dyn FnMut(Request),
-    ) -> DocumentId {
-        match self.document_ids_by_path.get(&path) {
-            Some(document_id) => *document_id,
-            None => {
-                let document_id = DocumentId(self.document_id_allocator.allocate());
-                self.documents_by_document_id.insert(
-                    document_id,
-                    Document {
-                        session_ids: HashSet::new(),
-                        is_destroyed: false,
-                        path: path.clone(),
-                        inner: None,
-                    },
-                );
-                self.document_ids_by_path.insert(path.clone(), document_id);
-                self.outstanding_document_id_queue.push_back(document_id);
-                send_request(Request::OpenFile(path));
-                document_id
-            }
-        }
-    }
-
-    pub fn finish_creating_document(
-        &mut self,
-        file_id: FileId,
-        revision: usize,
-        text: Text,
-        send_request: &mut dyn FnMut(Request),
-    ) -> DocumentId {
-        let document_id = self.outstanding_document_id_queue.pop_front().unwrap();
-        let document = &mut self.documents_by_document_id[document_id];
-        let token_cache = TokenCache::new(&text);
-        document.inner = Some(DocumentInner {
-            file_id,
-            revision,
-            text,
-            token_cache,
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
-            outstanding_deltas: VecDeque::new(),
-        });
-        self.document_ids_by_file_id.insert(file_id, document_id);
-        if document.is_destroyed {
-            let inner = document.inner.as_ref().unwrap();
-            send_request(Request::CloseFile(inner.file_id))
-        }
-        document_id
-    }
-
-    fn start_destroying_document(
-        &mut self,
-        document_id: DocumentId,
-        send_request: &mut dyn FnMut(Request),
-    ) {
-        let document = &mut self.documents_by_document_id[document_id];
-        match &mut document.inner {
-            Some(inner) => send_request(Request::CloseFile(inner.file_id)),
-            None => document.is_destroyed = true,
-        }
-        self.document_ids_by_path.remove(&document.path);
-    }
-
-    fn finish_destroying_document(&mut self, file_id: FileId) {
-        let document_id = self.document_ids_by_file_id[file_id];
-
-        let document = &mut self.documents_by_document_id[document_id];
-        let inner = document.inner.as_ref().unwrap();
-        self.document_ids_by_file_id.remove(inner.file_id);
-        self.documents_by_document_id.remove(document_id);
-        self.document_id_allocator.deallocate(document_id.0);
-    }
-
-    fn add_cursor(&mut self, session_id: SessionId, position: Position) {
-        let session = &mut self.sessions_by_session_id[session_id];
-        session.cursors.add(position);
-        session.update_selections_and_carets();
-    }
-
-    fn move_cursors_left(&mut self, session_id: SessionId, select: bool) {
-        let session = &mut self.sessions_by_session_id[session_id];
-        let document = &self.documents_by_document_id[session.document_id];
-        let document_inner = document.inner.as_ref().unwrap();
-        session.cursors.move_left(&document_inner.text, select);
-        session.update_selections_and_carets();
-    }
-
-    fn move_cursors_right(&mut self, session_id: SessionId, select: bool) {
-        let session = &mut self.sessions_by_session_id[session_id];
-        let document = &self.documents_by_document_id[session.document_id];
-        let document_inner = document.inner.as_ref().unwrap();
-        session.cursors.move_right(&document_inner.text, select);
-        session.update_selections_and_carets();
-    }
-
-    fn move_cursors_up(&mut self, session_id: SessionId, select: bool) {
-        let session = &mut self.sessions_by_session_id[session_id];
-        let document = &self.documents_by_document_id[session.document_id];
-        let document_inner = document.inner.as_ref().unwrap();
-        session.cursors.move_up(&document_inner.text, select);
-        session.update_selections_and_carets();
-    }
-
-    fn move_cursors_down(&mut self, session_id: SessionId, select: bool) {
-        let session = &mut self.sessions_by_session_id[session_id];
-        let document = &self.documents_by_document_id[session.document_id];
-        let document_inner = document.inner.as_ref().unwrap();
-        session.cursors.move_down(&document_inner.text, select);
-        session.update_selections_and_carets();
-    }
-
-    fn move_cursors_to(&mut self, session_id: SessionId, position: Position, select: bool) {
-        let session = &mut self.sessions_by_session_id[session_id];
-        session.cursors.move_to(position, select);
-        session.update_selections_and_carets();
-    }
-
-    fn insert_text(
-        &mut self,
-        session_id: SessionId,
-        text: Text,
-        send_request: &mut dyn FnMut(Request),
-    ) {
-        let session = &self.sessions_by_session_id[session_id];
-
-        let mut builder_0 = delta::Builder::new();
-        for span in session.selections.spans() {
-            if span.is_included {
-                builder_0.delete(span.len);
-            } else {
-                builder_0.retain(span.len);
-            }
-        }
-        let delta_0 = builder_0.build();
-
-        let mut builder_1 = delta::Builder::new();
-        let mut position = Position::origin();
-        for distance in session.carets.distances() {
-            position += distance;
-            builder_1.retain(distance);
-            if session.selections.contains_position(position) {
-                continue;
-            }
-            builder_1.insert(text.clone());
-            position += text.len();
-        }
-        let delta_1 = builder_1.build();
-
-        let (_, new_delta_1) = delta_0.clone().transform(delta_1);
-        let delta = delta_0.compose(new_delta_1);
-
-        self.apply_delta(session_id, delta, send_request);
-    }
-
-    fn insert_backspace(&mut self, session_id: SessionId, send_request: &mut dyn FnMut(Request)) {
-        let session = &self.sessions_by_session_id[session_id];
-        let document = &self.documents_by_document_id[session.document_id];
-        let document_inner = document.inner.as_ref().unwrap();
-
-        let mut builder_0 = delta::Builder::new();
-        for span in session.selections.spans() {
-            if span.is_included {
-                builder_0.delete(span.len);
-            } else {
-                builder_0.retain(span.len);
-            }
-        }
-        let delta_0 = builder_0.build();
-
-        let mut builder_1 = delta::Builder::new();
-        let mut position = Position::origin();
-        for distance in session.carets.distances() {
-            position += distance;
-            if !session.selections.contains_position(position) {
-                if position.column == 0 {
-                    if position.line != 0 {
-                        builder_1.retain(Size {
-                            line: distance.line - 1,
-                            column: document_inner.text.as_lines()[position.line - 1].len(),
-                        });
-                        builder_1.delete(Size { line: 1, column: 0 })
-                    }
-                } else {
-                    builder_1.retain(Size {
-                        line: distance.line,
-                        column: distance.column - 1,
-                    });
-                    builder_1.delete(Size { line: 0, column: 1 });
-                }
-            } else {
-                builder_1.retain(distance);
-            }
-        }
-        let delta_1 = builder_1.build();
-
-        let (_, new_delta_1) = delta_0.clone().transform(delta_1);
-        let delta = delta_0.compose(new_delta_1);
-
-        self.apply_delta(session_id, delta, send_request);
-    }
-
-    fn undo(&mut self, session_id: SessionId, send_request: &mut dyn FnMut(Request)) {
-        let session = &self.sessions_by_session_id[session_id];
-        let document = &mut self.documents_by_document_id[session.document_id];
-        let document_inner = document.inner.as_mut().unwrap();
-        if let Some(undo) = document_inner.undo_stack.pop() {
-            let inverse_delta = undo.delta.clone().invert(&document_inner.text);
-            document_inner.redo_stack.push(Edit {
-                cursors: session.cursors.clone(),
-                delta: inverse_delta,
-            });
-
-            let session = &mut self.sessions_by_session_id[session_id];
-            session.cursors = undo.cursors;
-            session.update_selections_and_carets();
-
-            let document = &self.documents_by_document_id[session.document_id];
-            for other_session_id in document.session_ids.iter().cloned() {
-                if other_session_id == session_id {
-                    continue;
-                }
-
-                let other_session = &mut self.sessions_by_session_id[other_session_id];
-                other_session.apply_delta(&undo.delta, Whose::Theirs);
-            }
-
-            let session = &mut self.sessions_by_session_id[session_id];
-            let document = &mut self.documents_by_document_id[session.document_id];
-            document.apply_delta(undo.delta.clone());
-            document.start_applying_delta(undo.delta, send_request);
-        }
-    }
-
-    fn redo(&mut self, session_id: SessionId, send_request: &mut dyn FnMut(Request)) {
-        let session = &self.sessions_by_session_id[session_id];
-        let document = &mut self.documents_by_document_id[session.document_id];
-        let document_inner = document.inner.as_mut().unwrap();
-        if let Some(redo) = document_inner.redo_stack.pop() {
-            let inverse_delta = redo.delta.clone().invert(&document_inner.text);
-            document_inner.undo_stack.push(Edit {
-                cursors: session.cursors.clone(),
-                delta: inverse_delta,
-            });
-
-            let session = &mut self.sessions_by_session_id[session_id];
-            session.cursors = redo.cursors;
-            session.update_selections_and_carets();
-
-            let document = &self.documents_by_document_id[session.document_id];
-            for other_session_id in document.session_ids.iter().cloned() {
-                if other_session_id == session_id {
-                    continue;
-                }
-
-                let other_session = &mut self.sessions_by_session_id[other_session_id];
-                other_session.apply_delta(&redo.delta, Whose::Theirs);
-            }
-
-            let session = &mut self.sessions_by_session_id[session_id];
-            let document = &mut self.documents_by_document_id[session.document_id];
-            document.apply_delta(redo.delta.clone());
-            document.start_applying_delta(redo.delta, send_request);
-        }
-    }
-
-    fn apply_delta(
-        &mut self,
-        session_id: SessionId,
-        delta: Delta,
-        send_request: &mut dyn FnMut(Request),
-    ) {
-        let session = &self.sessions_by_session_id[session_id];
-        let document = &mut self.documents_by_document_id[session.document_id];
-        let document_inner = document.inner.as_mut().unwrap();
-        let inverse_delta = delta.clone().invert(&document_inner.text);
-        document_inner.undo_stack.push(Edit {
-            cursors: session.cursors.clone(),
-            delta: inverse_delta,
-        });
-
-        let session = &mut self.sessions_by_session_id[session_id];
-        session.apply_delta(&delta, Whose::Ours);
-
-        let document = &self.documents_by_document_id[session.document_id];
-        for other_session_id in document.session_ids.iter().cloned() {
-            if other_session_id == session_id {
-                continue;
-            }
-
-            let other_session = &mut self.sessions_by_session_id[other_session_id];
-            other_session.apply_delta(&delta, Whose::Theirs);
-        }
-
-        let session = &mut self.sessions_by_session_id[session_id];
-        let document = &mut self.documents_by_document_id[session.document_id];
-        document.apply_delta(delta.clone());
-        document.start_applying_delta(delta, send_request);
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct SessionId(pub Id);
-
-impl AsRef<Id> for SessionId {
-    fn as_ref(&self) -> &Id {
-        &self.0
-    }
-}
-
-struct Session {
-    view_id: Option<ViewId>,
-    cursors: CursorSet,
-    selections: RangeSet,
-    carets: PositionSet,
-    document_id: DocumentId,
-}
-
-impl Session {
-    fn apply_delta(&mut self, delta: &Delta, whose: Whose) {
-        self.cursors.apply_delta(&delta, whose);
-        self.update_selections_and_carets();
-    }
-
-    fn update_selections_and_carets(&mut self) {
-        self.selections = self.cursors.selections();
-        self.carets = self.cursors.carets();
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct DocumentId(pub Id);
-
-impl AsRef<Id> for DocumentId {
-    fn as_ref(&self) -> &Id {
-        &self.0
-    }
-}
-
-struct Document {
-    session_ids: HashSet<SessionId>,
-    is_destroyed: bool,
-    path: PathBuf,
-    inner: Option<DocumentInner>,
-}
-
-struct DocumentInner {
-    file_id: FileId,
-    revision: usize,
-    text: Text,
-    token_cache: TokenCache,
-    undo_stack: Vec<Edit>,
-    redo_stack: Vec<Edit>,
-    outstanding_deltas: VecDeque<Delta>,
-}
-
-impl Document {
-    fn apply_delta(&mut self, delta: Delta) {
-        let inner = self.inner.as_mut().unwrap();
-        inner.token_cache.invalidate(&delta);
-        inner.text.apply_delta(delta);
-        inner.token_cache.refresh(&inner.text);
-    }
-
-    fn start_applying_delta(&mut self, delta: Delta, send_request: &mut dyn FnMut(Request)) {
-        let inner = self.inner.as_mut().unwrap();
-        if inner.outstanding_deltas.len() == 2 {
-            let outstanding_delta = inner.outstanding_deltas.pop_back().unwrap();
-            inner
-                .outstanding_deltas
-                .push_back(outstanding_delta.compose(delta));
-        } else {
-            inner.outstanding_deltas.push_back(delta.clone());
-            if inner.outstanding_deltas.len() == 1 {
-                send_request(Request::ApplyDelta(
-                    inner.file_id,
-                    inner.revision,
-                    inner.outstanding_deltas.front().unwrap().clone(),
-                ));
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Edit {
-    cursors: CursorSet,
-    delta: Delta,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct VisibleLines {
     start: usize,
     end: usize,
     start_y: f32,
-}
-
-fn transform_edit_stack(edit_stack: &mut Vec<Edit>, delta: Delta) {
-    let mut delta = delta;
-    for edit in edit_stack.iter_mut().rev() {
-        let edit_delta = mem::replace(&mut edit.delta, Delta::identity());
-        edit.cursors.apply_delta(&delta, Whose::Theirs);
-        let (new_delta, new_edit_delta) = delta.transform(edit_delta);
-        delta = new_delta;
-        edit.delta = new_edit_delta;
-    }
 }
