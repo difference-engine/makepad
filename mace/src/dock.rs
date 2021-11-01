@@ -213,13 +213,13 @@ impl Dock {
                                 dispatch_action(cx, Action::TabBarReceivedDraggedItem(*panel_id, item))
                             }
                             tab_bar::Action::TabWasPressed(tab_id) => {
-                                dispatch_action(cx, Action::TabWasPressed(tab_id))
+                                dispatch_action(cx, Action::TabWasPressed(*panel_id, tab_id))
                             }
                             tab_bar::Action::TabButtonWasPressed(tab_id) => {
-                                dispatch_action(cx, Action::TabButtonWasPressed(tab_id))
+                                dispatch_action(cx, Action::TabButtonWasPressed(*panel_id, tab_id))
                             }
                             tab_bar::Action::TabReceivedDraggedItem(tab_id, item) => {
-                                dispatch_action(cx, Action::TabReceivedDraggedItem(tab_id, item))
+                                dispatch_action(cx, Action::TabReceivedDraggedItem(*panel_id, tab_id, item))
                             }
                         });
                 }
@@ -329,9 +329,9 @@ pub enum DragPosition {
 pub enum Action {
     SplitPanelChanged(PanelId),
     TabBarReceivedDraggedItem(PanelId, DraggedItem),
-    TabWasPressed(TabId),
-    TabButtonWasPressed(TabId),
-    TabReceivedDraggedItem(TabId, DraggedItem),
+    TabWasPressed(PanelId, TabId),
+    TabButtonWasPressed(PanelId, TabId),
+    TabReceivedDraggedItem(PanelId, TabId, DraggedItem),
     ContentsReceivedDraggedItem(PanelId, DragPosition, DraggedItem),
 }
 

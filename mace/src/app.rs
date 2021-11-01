@@ -159,7 +159,7 @@ impl AppInner {
                             }
                         }
                         TabKind::CodeEditor { .. } => {
-                            let panel = state.panels_by_panel_id[tab.panel_id].as_tab_panel();
+                            let panel = state.panels_by_panel_id[panel_id].as_tab_panel();
                             self.code_editor.draw(
                                 cx,
                                 &state.code_editor_state,
@@ -212,12 +212,11 @@ impl AppInner {
                         self.create_code_editor_tab(cx, state, panel_id, None, path);
                     }
                 }
-                dock::Action::TabWasPressed(tab_id) => self.select_tab(cx, state, tab_id),
-                dock::Action::TabButtonWasPressed(tab_id) => {
+                dock::Action::TabWasPressed(panel_id, tab_id) => self.select_tab(cx, state, panel_id, tab_id),
+                dock::Action::TabButtonWasPressed(panel_id, tab_id) => {
                     let tab = &state.tabs_by_tab_id[tab_id];
                     match tab.kind {
                         TabKind::CodeEditor { session_id } => {
-                            let panel_id = tab.panel_id;
                             let panel = state
                                 .panels_by_panel_id
                                 .get_mut(panel_id)
@@ -250,9 +249,7 @@ impl AppInner {
                         _ => {}
                     }
                 }
-                dock::Action::TabReceivedDraggedItem(tab_id, item) => {
-                    let tab = &state.tabs_by_tab_id[tab_id];
-                    let panel_id = tab.panel_id;
+                dock::Action::TabReceivedDraggedItem(panel_id, tab_id, item) => {
                     for file_url in &item.file_urls {
                         let path = Path::new(&file_url[7..]).to_path_buf();
                         self.create_code_editor_tab(cx, state, panel_id, Some(tab_id), path);
@@ -281,7 +278,7 @@ impl AppInner {
                     if node.is_file() {
                         let path = state.file_node_path(file_node_id);
                         if state.code_editor_state.document_id_by_path(&path).is_none() {
-                            self.create_code_editor_tab(cx, state, state.panel_id, None, path);
+                            self.create_code_editor_tab(cx, state, state.selected_panel_id, None, path);
                         }
                     }
                 }
@@ -355,8 +352,8 @@ impl AppInner {
     fn handle_response(&mut self, cx: &mut Cx, state: &mut State, response: Response) {
         match response {
             Response::GetFileTree(response) => {
-                self.select_tab(cx, state, state.file_tree_tab_id);
                 self.set_file_tree(cx, state, response.unwrap());
+                self.select_tab(cx, state, state.side_bar_panel_id, state.file_tree_tab_id);
             }
             Response::OpenFile(response) => {
                 let (path, revision, text) = response.unwrap();
@@ -480,7 +477,6 @@ impl AppInner {
         state.tabs_by_tab_id.insert(
             tab_id,
             Tab {
-                panel_id,
                 name,
                 kind: TabKind::CodeEditor { session_id },
             },
@@ -503,12 +499,11 @@ impl AppInner {
             }
             None => panel.tab_ids.push(tab_id),
         }
-        self.select_tab(cx, state, tab_id);
+        self.select_tab(cx, state, panel_id, tab_id);
     }
 
-    fn select_tab(&mut self, cx: &mut Cx, state: &mut State, tab_id: TabId) {
+    fn select_tab(&mut self, cx: &mut Cx, state: &mut State, panel_id: PanelId, tab_id: TabId) {
         let tab = &state.tabs_by_tab_id[tab_id];
-        let panel_id = tab.panel_id;
         self.dock.set_selected_tab_id(cx, panel_id, Some(tab_id));
         self.dock.redraw_tab_bar(cx, panel_id);
         match tab.kind {
@@ -575,7 +570,8 @@ struct State {
     panel_id_allocator: IdAllocator,
     panels_by_panel_id: IdMap<PanelId, Panel>,
     root_panel_id: PanelId,
-    panel_id: PanelId,
+    side_bar_panel_id: PanelId,
+    selected_panel_id: PanelId,
     tab_id_allocator: IdAllocator,
     tabs_by_tab_id: IdMap<TabId, Tab>,
     file_tree_tab_id: TabId,
@@ -607,10 +603,10 @@ impl State {
 
         let root_panel_id = PanelId(panel_id_allocator.allocate());
 
-        let panel_0_id = PanelId(panel_id_allocator.allocate());
+        let side_bar_panel_id = PanelId(panel_id_allocator.allocate());
         let file_tree_tab_id = TabId(tab_id_allocator.allocate());
         panels_by_panel_id.insert(
-            panel_0_id,
+            side_bar_panel_id,
             Panel {
                 parent_panel_id: Some(root_panel_id),
                 kind: PanelKind::Tab(TabPanel {
@@ -622,15 +618,14 @@ impl State {
         tabs_by_tab_id.insert(
             file_tree_tab_id,
             Tab {
-                panel_id: panel_0_id,
                 name: String::from("File Tree"),
                 kind: TabKind::FileTree,
             },
         );
 
-        let panel_1_id = PanelId(panel_id_allocator.allocate());
+        let content_panel_id = PanelId(panel_id_allocator.allocate());
         panels_by_panel_id.insert(
-            panel_1_id,
+            content_panel_id,
             Panel {
                 parent_panel_id: Some(root_panel_id),
                 kind: PanelKind::Tab(TabPanel {
@@ -645,7 +640,7 @@ impl State {
             Panel {
                 parent_panel_id: None,
                 kind: PanelKind::Split(SplitPanel {
-                    child_panel_ids: [panel_0_id, panel_1_id],
+                    child_panel_ids: [side_bar_panel_id, content_panel_id],
                 }),
             },
         );
@@ -654,7 +649,8 @@ impl State {
             panel_id_allocator,
             panels_by_panel_id,
             root_panel_id,
-            panel_id: panel_1_id,
+            side_bar_panel_id,
+            selected_panel_id: content_panel_id,
             tab_id_allocator,
             tabs_by_tab_id,
             file_tree_tab_id,
@@ -776,7 +772,6 @@ struct TabPanel {
 }
 
 struct Tab {
-    panel_id: PanelId,
     name: String,
     kind: TabKind,
 }
