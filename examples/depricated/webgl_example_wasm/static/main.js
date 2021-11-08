@@ -4,7 +4,7 @@ import { init as initWebgl } from "./webgl.js";
 
 export async function main() {
   let { sierpinski: sierpinskiWasm } = await initWasm(
-    "/makepad/target/wasm32-unknown-unknown/release/webgl_example_wasm.wasm"
+    "/target/wasm32-unknown-unknown/release/webgl_example_wasm.wasm"
   );
   let now = performance.now();
   let vertices = sierpinskiWasm(8);

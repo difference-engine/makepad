@@ -368,6 +368,13 @@ impl SerBin for OsStr {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+impl SerBin for OsStr {
+    fn ser_bin(&self, s: &mut Vec<u8>) {
+        self.to_string_lossy().as_bytes().ser_bin(s)
+    }
+}
+
 impl SerBin for char {
     fn ser_bin(&self, s: &mut Vec<u8>) {
         let mut bytes = [0; 4];

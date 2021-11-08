@@ -5,5 +5,5 @@ authors = ["Eddy Bruel <ejpbruel@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-makepad-render = { git = "https://github.com/makepad/makepad.git", branch = "dev" }
-makepad-widget = { git = "https://github.com/makepad/makepad.git", branch = "dev" }
+makepad-render = { path = "../render" }
+makepad-widget = { path = "../widget" }

@@ -284,8 +284,8 @@ impl CodeEditor {
         } = live_text_style!(cx, self::text_style).font_size * self.text.get_monospace_base(cx);
         let line_index = (position.y / line_height) as usize;
         Position {
-            line: index,
-            column: ((position.x / char_width) as usize).min(lines[index].len()),
+            line: line_index,
+            column: ((position.x / char_width) as usize).min(lines[line_index].len()),
         }
     }
 }
